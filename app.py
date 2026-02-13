@@ -7,8 +7,7 @@ funding vs. voting outcomes for every U.S. House district.
 
 Data Sources:
   - FEC bulk data: https://www.fec.gov/data/browse-data/?tab=bulk-data
-  - MIT MEDSL: https://doi.org/10.7910/DVN/IG0UN2 (House 1976-2022)
-  - MIT MEDSL 2024: https://github.com/MEDSL/2024-elections-official
+  - MIT MEDSL: https://doi.org/10.7910/DVN/IG0UN2 (House 1976-2024)
 """
 
 import streamlit as st
@@ -16,7 +15,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
-import requests
+import glob
 import warnings
 
 warnings.filterwarnings("ignore")
@@ -34,14 +33,8 @@ st.set_page_config(
 # ============================================================
 # CONSTANTS
 # ============================================================
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 FEC_PATH = os.path.join(DATA_DIR, "fec_house_candidates.xlsx")
-
-# MIT MEDSL House results 1976-2022 (Harvard Dataverse)
-VOTING_CSV_URL = (
-    "https://dataverse.harvard.edu/api/access/datafile/7426291"
-)
-VOTING_PATH = os.path.join(DATA_DIR, "1976-2022-house.csv")
 
 STATES = {
     "AL": "Alabama", "AK": "Alaska", "AZ": "Arizona", "AR": "Arkansas",
@@ -69,6 +62,27 @@ REP_LIGHT = "#F4A582"
 # ============================================================
 # DATA LOADING
 # ============================================================
+def find_voting_file():
+    """Find the MIT voting results file - handles various naming conventions."""
+    patterns = [
+        os.path.join(DATA_DIR, "1976-2024-house.csv"),
+        os.path.join(DATA_DIR, "1976-2022-house.csv"),
+        os.path.join(DATA_DIR, "1976-2024-house.tab"),
+        os.path.join(DATA_DIR, "1976-2022-house.tab"),
+    ]
+    # Also try glob for any house csv/tab in data dir
+    for pattern in patterns:
+        if os.path.exists(pattern):
+            return pattern
+
+    glob_matches = glob.glob(os.path.join(DATA_DIR, "*house*.csv")) + \
+                   glob.glob(os.path.join(DATA_DIR, "*house*.tab"))
+    if glob_matches:
+        return glob_matches[0]
+
+    return None
+
+
 @st.cache_data(show_spinner="Loading FEC funding data...")
 def load_fec_data():
     """Load the combined FEC House candidate bulk data Excel file."""
@@ -97,42 +111,54 @@ def load_fec_data():
 def load_voting_data():
     """
     Load MIT Election Data + Science Lab House results.
-    Downloads from Harvard Dataverse on first run.
+    Handles both CSV and tab-delimited formats.
     Columns: year, state, state_po, state_fips, state_cen, office,
              district, stage, runoff, special, candidate, party,
              writein, mode, candidatevotes, totalvotes, unofficial, version, fusion_ticket
     """
-    os.makedirs(DATA_DIR, exist_ok=True)
+    voting_path = find_voting_file()
 
-    if not os.path.exists(VOTING_PATH):
-        st.info("Downloading MIT House election results (one-time, ~15MB)...")
+    if voting_path is None:
+        st.warning(
+            "⚠️ **Voting results file not found.**\n\n"
+            "To add voting data, download from:\n"
+            "[MIT Election Lab - U.S. House 1976-2024]"
+            "(https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/IG0UN2)\n\n"
+            "Save the `.tab` or `.csv` file into the `data/` folder in your repo."
+        )
+        return pd.DataFrame()
+
+    # Try CSV first, then tab-delimited
+    try:
+        df = pd.read_csv(voting_path, dtype={"district": str, "state_po": str})
+    except Exception:
         try:
-            r = requests.get(VOTING_CSV_URL, timeout=120, stream=True)
-            r.raise_for_status()
-            with open(VOTING_PATH, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            st.success("Download complete!")
+            df = pd.read_csv(voting_path, sep="\t", dtype={"district": str, "state_po": str})
         except Exception as e:
-            st.warning(
-                f"Could not auto-download voting data: {e}\n\n"
-                "You can manually download it from:\n"
-                "https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/IG0UN2\n\n"
-                "Save as `data/1976-2022-house.csv`"
-            )
+            st.error(f"Could not read voting file: {e}")
             return pd.DataFrame()
 
-    df = pd.read_csv(VOTING_PATH, dtype={"district": str, "state_po": str})
+    # Standardize column names to lowercase
+    df.columns = df.columns.str.lower().str.strip()
 
     # Filter to general election results only
-    df = df[df["stage"] == "GEN"].copy()
+    if "stage" in df.columns:
+        df = df[df["stage"].str.upper() == "GEN"].copy()
 
     # Normalize
-    df["district"] = df["district"].fillna("0").str.zfill(2)
-    df["state_po"] = df["state_po"].str.upper()
+    df["district"] = df["district"].fillna("0").astype(str).str.zfill(2)
+    # Handle district "0" -> "00" for at-large
+    df["district"] = df["district"].apply(lambda d: "00" if d in ("0", "00") else d.zfill(2))
+    df["state_po"] = df["state_po"].astype(str).str.upper()
+
+    # Normalize party names
     df["party_clean"] = df["party"].fillna("").str.upper().apply(
         lambda p: "DEM" if "DEMOCRAT" in p else ("REP" if "REPUBLICAN" in p else "OTH")
     )
+
+    # Ensure numeric vote columns
+    df["candidatevotes"] = pd.to_numeric(df["candidatevotes"], errors="coerce").fillna(0)
+    df["totalvotes"] = pd.to_numeric(df["totalvotes"], errors="coerce").fillna(0)
 
     return df
 
@@ -199,7 +225,6 @@ def plot_funding_vs_voting(fund_df, vote_df, state, district):
       - Bars: DEM/REP funding (left y-axis)
       - Lines: DEM/REP vote totals (right y-axis)
     """
-    # Merge on CYCLE
     if vote_df.empty:
         merged = fund_df.copy()
         merged["DEM_VOTES"] = 0
@@ -213,14 +238,13 @@ def plot_funding_vs_voting(fund_df, vote_df, state, district):
             how="outer",
         ).fillna(0).sort_values("CYCLE")
 
-    # Rename funding columns
     merged = merged.rename(columns={"DEM": "DEM_FUND", "REP": "REP_FUND"})
     for col in ["DEM_FUND", "REP_FUND", "DEM_VOTES", "REP_VOTES"]:
         if col not in merged.columns:
             merged[col] = 0
 
     merged = merged.sort_values("CYCLE")
-    cycles = merged["CYCLE"].astype(str).tolist()
+    cycles = merged["CYCLE"].astype(int).astype(str).tolist()
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
@@ -307,10 +331,10 @@ def plot_funding_breakdown(detail_df):
             continue
         agg = pdf.groupby("CYCLE")[list(source_cols.keys())].sum().reset_index()
         agg = agg.sort_values("CYCLE")
-        cycles = agg["CYCLE"].astype(str).tolist()
+        cycles = agg["CYCLE"].astype(int).astype(str).tolist()
 
-        colors = ["#4393C3", "#92C5DE", "#D1E5F0", "#F7F7F7"] if party == "DEM" else [
-            "#D6604D", "#F4A582", "#FDDBC7", "#F7F7F7"
+        colors = ["#4393C3", "#92C5DE", "#D1E5F0", "#B0B0B0"] if party == "DEM" else [
+            "#D6604D", "#F4A582", "#FDDBC7", "#B0B0B0"
         ]
 
         for i, (col, label) in enumerate(source_cols.items()):
@@ -336,13 +360,11 @@ def plot_spending_efficiency(detail_df, vote_df):
     if vote_df.empty:
         return None
 
-    # Reshape votes to candidate-level (approximate: party total for the district)
     vote_party = vote_df.melt(
         id_vars=["CYCLE"], value_vars=["DEM", "REP"],
         var_name="PARTY", value_name="VOTES"
     )
 
-    # Get party-level spending
     spend = (
         detail_df.groupby(["CYCLE", "PARTY"])["TTL_DISB"]
         .sum()
@@ -362,7 +384,7 @@ def plot_spending_efficiency(detail_df, vote_df):
         fig.add_trace(go.Scatter(
             x=pdf["TTL_DISB"], y=pdf["VOTES"],
             mode="markers+text",
-            text=pdf["CYCLE"].astype(str),
+            text=pdf["CYCLE"].astype(int).astype(str),
             textposition="top center",
             textfont=dict(size=9),
             marker=dict(color=color, size=12, opacity=0.8),
@@ -396,7 +418,8 @@ def sidebar_controls(fec_df):
 
     # State selector
     state_options = {f"{v} ({k})": k for k, v in sorted(STATES.items(), key=lambda x: x[1])}
-    selected_label = st.sidebar.selectbox("**State**", list(state_options.keys()), index=list(state_options.values()).index("TX"))
+    default_idx = list(state_options.values()).index("TX") if "TX" in state_options.values() else 0
+    selected_label = st.sidebar.selectbox("**State**", list(state_options.keys()), index=default_idx)
     state = state_options[selected_label]
 
     # Get districts for this state from the data
@@ -405,7 +428,7 @@ def sidebar_controls(fec_df):
         state_districts = ["00"]
 
     district_labels = [
-        f"At-Large (00)" if d == "00" else f"District {d}" for d in state_districts
+        "At-Large (00)" if d == "00" else f"District {d}" for d in state_districts
     ]
     district_map = dict(zip(district_labels, state_districts))
     selected_dist_label = st.sidebar.selectbox("**District**", district_labels)
@@ -441,17 +464,14 @@ def main():
 
     # Header
     state_name = STATES.get(state, state)
-    dist_label = f"{state}-{district}"
-    st.markdown(
-        f"# 🏛️ {state_name} — House District {district}"
-    )
+    st.markdown(f"# 🏛️ {state_name} — House District {district}")
 
     # Aggregate data
     fund_agg, fund_detail = aggregate_funding(fec_df, state, district)
     vote_agg = aggregate_votes(votes_df, state, district) if not votes_df.empty else pd.DataFrame()
 
     if fund_agg.empty:
-        st.warning(f"No FEC funding data found for {dist_label}.")
+        st.warning(f"No FEC funding data found for {state}-{district}.")
         return
 
     # ── Summary metrics ──
@@ -460,7 +480,6 @@ def main():
     latest = fund_detail[fund_detail["CYCLE"] == latest_cycle]
     dem_latest = latest[latest["PARTY"] == "DEM"]["TTL_RECEIPTS"].sum()
     rep_latest = latest[latest["PARTY"] == "REP"]["TTL_RECEIPTS"].sum()
-    total_candidates = len(fund_detail[fund_detail["CYCLE"] == latest_cycle])
     n_cycles = fund_detail["CYCLE"].nunique()
 
     col1.metric("Latest Cycle", str(int(latest_cycle)))
@@ -478,13 +497,14 @@ def main():
     if vote_agg.empty:
         st.caption(
             "⚠️ Voting results not available for this district. "
-            "MIT MEDSL data covers 1976–2022 for most districts."
+            "The MIT MEDSL voting data file may not be loaded."
         )
     else:
         vote_years = sorted(vote_agg["CYCLE"].unique())
         st.caption(
-            f"📊 Voting data available: {int(min(vote_years))}–{int(max(vote_years))} "
-            f"(MIT Election Data + Science Lab)"
+            f"📊 Voting data: {int(min(vote_years))}–{int(max(vote_years))} "
+            f"(MIT Election Data + Science Lab) | "
+            f"Funding data: {int(fund_detail['CYCLE'].min())}–{int(fund_detail['CYCLE'].max())} (FEC)"
         )
 
     # ── Funding breakdown ──
@@ -505,6 +525,7 @@ def main():
     # ── Candidate detail table ──
     if show_table:
         st.markdown("---")
+        dist_label = f"{state}-{district}"
         st.markdown(f"### 📋 Candidate Details — {dist_label}")
 
         display_cols = [
@@ -530,7 +551,6 @@ def main():
             "CAND_LOANS": "Candidate Loans",
         })
 
-        # Format currency columns
         money_cols = ["Total Receipts", "Total Spent", "Cash on Hand",
                       "Individual $", "PAC $", "Party $", "Self-Fund $", "Candidate Loans"]
         for col in money_cols:
@@ -539,7 +559,6 @@ def main():
                     lambda v: f"${v:,.0f}" if pd.notna(v) else "—"
                 )
 
-        # Status labels
         status_map = {"I": "Incumbent", "C": "Challenger", "O": "Open Seat"}
         if "Status" in table_df.columns:
             table_df["Status"] = table_df["Status"].map(status_map).fillna("")
@@ -561,11 +580,11 @@ def main():
             height=min(len(table_df) * 38 + 40, 600),
         )
 
-    # ── Voting results table (from MIT data) ──
-    if show_table and not vote_agg.empty:
+    # ── Voting results table ──
+    if show_table and not votes_df.empty and not vote_agg.empty:
+        dist_label = f"{state}-{district}"
         st.markdown(f"### 🗳️ General Election Results — {dist_label}")
 
-        # Get raw candidate-level voting data
         mask = (votes_df["state_po"] == state) & (votes_df["district"] == district)
         raw_votes = votes_df[mask][["year", "candidate", "party", "candidatevotes", "totalvotes"]].copy()
         raw_votes = raw_votes.sort_values(["year", "candidatevotes"], ascending=[True, False])
