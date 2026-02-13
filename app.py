@@ -553,11 +553,14 @@ def main():
 
         money_cols = ["Total Receipts", "Total Spent", "Cash on Hand",
                       "Individual $", "PAC $", "Party $", "Self-Fund $", "Candidate Loans"]
+
+        # Keep values numeric — use column_config for display formatting
         for col in money_cols:
             if col in table_df.columns:
-                table_df[col] = table_df[col].apply(
-                    lambda v: f"${v:,.0f}" if pd.notna(v) else "—"
-                )
+                table_df[col] = pd.to_numeric(table_df[col], errors="coerce")
+
+        # Ensure CYCLE is int for proper sorting
+        table_df["CYCLE"] = table_df["CYCLE"].astype(int)
 
         status_map = {"I": "Incumbent", "C": "Challenger", "O": "Open Seat"}
         if "Status" in table_df.columns:
@@ -574,10 +577,19 @@ def main():
         if cycle_filter:
             table_df = table_df[table_df["CYCLE"].isin(cycle_filter)]
 
+        # Build column_config for currency display (keeps numeric for sorting)
+        col_config = {
+            "CYCLE": st.column_config.NumberColumn("CYCLE", format="%d"),
+        }
+        for col in money_cols:
+            if col in table_df.columns:
+                col_config[col] = st.column_config.NumberColumn(col, format="$%,.0f")
+
         st.dataframe(
             table_df.reset_index(drop=True),
             use_container_width=True,
             height=min(len(table_df) * 38 + 40, 600),
+            column_config=col_config,
         )
 
     # ── Voting results table ──
@@ -593,8 +605,11 @@ def main():
             "year": "Year", "candidate": "Candidate", "party": "Party",
             "candidatevotes": "Votes", "totalvotes": "Total Votes", "vote_pct": "Vote %"
         })
-        raw_votes["Votes"] = raw_votes["Votes"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
-        raw_votes["Total Votes"] = raw_votes["Total Votes"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+
+        # Keep numeric for proper sorting
+        raw_votes["Year"] = raw_votes["Year"].astype(int)
+        raw_votes["Votes"] = pd.to_numeric(raw_votes["Votes"], errors="coerce")
+        raw_votes["Total Votes"] = pd.to_numeric(raw_votes["Total Votes"], errors="coerce")
 
         vote_year_filter = st.multiselect(
             "Filter voting years:",
@@ -605,7 +620,19 @@ def main():
         if vote_year_filter:
             raw_votes = raw_votes[raw_votes["Year"].isin(vote_year_filter)]
 
-        st.dataframe(raw_votes.reset_index(drop=True), use_container_width=True, height=400)
+        vote_col_config = {
+            "Year": st.column_config.NumberColumn("Year", format="%d"),
+            "Votes": st.column_config.NumberColumn("Votes", format="%,.0f"),
+            "Total Votes": st.column_config.NumberColumn("Total Votes", format="%,.0f"),
+            "Vote %": st.column_config.NumberColumn("Vote %", format="%.1f%%"),
+        }
+
+        st.dataframe(
+            raw_votes.reset_index(drop=True),
+            use_container_width=True,
+            height=400,
+            column_config=vote_col_config,
+        )
 
 
 if __name__ == "__main__":
